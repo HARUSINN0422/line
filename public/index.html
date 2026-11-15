@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LINE Control</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#101820;color:#edf3f7;font-family:system-ui,sans-serif}
+main{max-width:620px;margin:40px auto;padding:20px}
+h1{font-size:25px;font-weight:650}
+.panel{background:#1c2934;border:1px solid #344653;border-radius:14px;padding:20px;margin:16px 0}
+.status{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #344653}
+.value{color:#a9d8b5}
+button{width:100%;padding:15px;margin:7px 0;border:0;border-radius:9px;font-size:16px;font-weight:600;cursor:pointer}
+.primary{background:#06c755;color:#071b10}
+.secondary{background:#344653;color:#fff}
+button:disabled{opacity:.4;cursor:not-allowed}
+#message{min-height:48px;white-space:pre-wrap;color:#c8d5df}
+small{color:#aab9c5;line-height:1.7}
+</style>
+</head>
+<body>
+<main>
+<h1>LINE Control</h1>
+<div class="panel">
+  <div class="status"><span>ADB接続</span><span id="adb" class="value">確認中</span></div>
+  <div class="status"><span>LINEアプリ</span><span id="line" class="value">確認中</span></div>
+  <div class="status"><span>表示中のトーク</span><span id="room" class="value">---</span></div>
+</div>
+<div class="panel">
+  <h3>LINE操作</h3>
+  <button class="secondary" onclick="send('launch')">LINEを開く</button>
+  <button class="primary" onclick="send('start')">グループ音声通話を開始</button>
+  <button class="secondary" disabled>通話に参加（準備中）</button>
+  <button class="secondary" disabled>通話から退出（準備中）</button>
+  <p id="message">状態を確認しています。</p>
+</div>
+<small>
+このサイトは同じLAN内からの利用を想定しています。<br>
+通話開始操作の前に、LINEで対象グループのトークを表示してください。
+</small>
+</main>
+<script>
+async function refresh(){
+  try{
+    const r=await fetch('/api/status');
+    const s=await r.json();
+    document.getElementById('adb').textContent=s.connected?'接続済み':'未接続';
+    document.getElementById('line').textContent=s.running?'起動中':'停止中';
+    document.getElementById('room').textContent=s.title||'取得できません';
+  }catch(e){
+    document.getElementById('adb').textContent='確認失敗';
+  }
+}
+async function send(action){
+  const m=document.getElementById('message');
+  m.textContent='操作中...';
+  try{
+    const r=await fetch('/api/action',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action})
+    });
+    const d=await r.json();
+    m.textContent=d.message||d.error||'完了';
+  }catch(e){m.textContent='通信エラー: '+e.message}
+  setTimeout(refresh,1000);
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>
