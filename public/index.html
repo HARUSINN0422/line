@@ -15,7 +15,8 @@ h1{font-size:25px;font-weight:650}
 button{width:100%;padding:15px;margin:7px 0;border:0;border-radius:9px;font-size:16px;font-weight:600;cursor:pointer}
 .primary{background:#06c755;color:#071b10}
 .secondary{background:#344653;color:#fff}
-button:disabled{opacity:.4;cursor:not-allowed}
+button:disabled,select:disabled{opacity:.4;cursor:not-allowed}
+select{width:100%;padding:14px;margin:7px 0;background:#101820;color:#edf3f7;border:1px solid #506575;border-radius:9px;font-size:16px}
 #message{min-height:48px;white-space:pre-wrap;color:#c8d5df}
 small{color:#aab9c5;line-height:1.7}
 </style>
@@ -31,7 +32,12 @@ small{color:#aab9c5;line-height:1.7}
 <div class="panel">
   <h3>LINE操作</h3>
   <button class="secondary" onclick="send('launch')">LINEを開く</button>
-  <button class="primary" onclick="send('start')">グループ音声通話を開始</button>
+  <button class="secondary" onclick="loadGroups()">グループ一覧を取得</button>
+  <select id="groups" disabled>
+    <option value="">先にグループ一覧を取得してください</option>
+  </select>
+  <button class="secondary" id="openGroup" onclick="openSelectedGroup()" disabled>選択したグループを開く</button>
+  <button class="primary" onclick="send('start')">選択したグループで音声通話を開始</button>
   <button class="secondary" disabled>通話に参加（準備中）</button>
   <button class="secondary" disabled>通話から退出（準備中）</button>
   <p id="message">状態を確認しています。</p>
@@ -42,6 +48,39 @@ small{color:#aab9c5;line-height:1.7}
 </small>
 </main>
 <script>
+async function loadGroups(){
+  const message=document.getElementById('message');
+  const select=document.getElementById('groups');
+  const openButton=document.getElementById('openGroup');
+  message.textContent='グループ一覧を取得しています...';
+  select.disabled=true;
+  openButton.disabled=true;
+  try{
+    const r=await fetch('/api/groups',{cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error||'一覧を取得できません');
+    select.innerHTML='';
+    if(!d.groups || d.groups.length===0){
+      select.add(new Option('グループが見つかりません',''));
+      message.textContent='グループが見つかりません。LINEのトーク一覧を表示して再取得してください。';
+      return;
+    }
+    d.groups.forEach((g,i)=>{
+      const label=g.name+(g.memberCount?' '+g.memberCount:'');
+      select.add(new Option(label,String(i)));
+    });
+    select.disabled=false;
+    openButton.disabled=false;
+    message.textContent=d.groups.length+'件のグループを取得しました。対象を選択してください。';
+  }catch(e){
+    message.textContent='グループ一覧の取得に失敗: '+e.message;
+  }
+}
+async function openSelectedGroup(){
+  const select=document.getElementById('groups');
+  if(select.value==='') return;
+  await send('open-group',Number(select.value));
+}
 async function refresh(){
   try{
     const r=await fetch('/api/status');
@@ -53,14 +92,14 @@ async function refresh(){
     document.getElementById('adb').textContent='確認失敗';
   }
 }
-async function send(action){
+async function send(action,groupIndex){
   const m=document.getElementById('message');
   m.textContent='操作中...';
   try{
     const r=await fetch('/api/action',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action})
+      body:JSON.stringify({action,groupIndex})
     });
     const d=await r.json();
     m.textContent=d.message||d.error||'完了';
