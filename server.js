@@ -117,6 +117,7 @@ async function scanGroups(targetIndex = null) {
   const unique = new Map();
   const maxPages = 80;
   let unchangedPages = 0;
+  let scrolls = 0;
   let opened = false;
   try {
     for (let page = 0; page < maxPages; page++) {
@@ -146,6 +147,7 @@ async function scanGroups(targetIndex = null) {
       await adb(['shell', 'input', 'swipe',
         String(Math.round(width * 0.5)), String(Math.round(height * 0.82)),
         String(Math.round(width * 0.5)), String(Math.round(height * 0.28)), '450']);
+      scrolls++;
       await new Promise(resolve => setTimeout(resolve, 450));
     }
     if (targetIndex !== null) throw new Error('指定したグループが見つかりません。一覧を再取得してください');
@@ -153,7 +155,7 @@ async function scanGroups(targetIndex = null) {
   } finally {
     if (!opened) {
       // 一覧取得後は先頭へ戻す
-      for (let i = 0; i < maxPages; i++) {
+      for (let i = 0; i < scrolls + 2; i++) {
         await adb(['shell', 'input', 'swipe',
           String(Math.round(width * 0.5)), String(Math.round(height * 0.25)),
           String(Math.round(width * 0.5)), String(Math.round(height * 0.82)), '350']).catch(() => {});
