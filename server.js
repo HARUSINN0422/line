@@ -65,7 +65,7 @@ async function getScreen() {
 function parseChatRows(xml) {
   const root = { children: [] };
   const stack = [root];
-  const tokens = xml.match(/<node\\b[^>]*\\/>|<node\\b[^>]*>|<\\/node>/g) || [];
+  const tokens = xml.match(/<node\b[^>]*\/>|<node\b[^>]*>|<\/node>/g) || [];
   for (const token of tokens) {
     if (token.startsWith('</node')) {
       if (stack.length > 1) stack.pop();
@@ -151,7 +151,7 @@ async function action(name, parameter) {
     if (!Number.isInteger(index) || index < 0 || index >= rows.length) {
       throw new Error('グループ一覧が更新されています。一覧を再取得してください');
     }
-    const b = rows[index].bounds.match(/\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]/);
+    const b = rows[index].bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
     if (!b) throw new Error('選択したグループの位置を読み取れません');
     const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
     const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
