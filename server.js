@@ -105,12 +105,67 @@ function parseChatRows(xml) {
   return rows;
 }
 
-async function getGroups() {
-  if ((await adb(['get-state'])) !== 'device') {
-    throw new Error('ADBがAndroidに接続されていません');
+async function scanGroups(targetIndex = null) {
+  if ((await adb(['get-state'])) !== 'device') throw new Error('ADBがAndroidに接続されていません');
+  let width = 1080, height = 2400;
+  try {
+    const size = await adb(['shell', 'wm', 'size']);
+    const match = size.match(/(\d+)x(\d+)/);
+    if (match) { width = Number(match[1]); height = Number(match[2]); }
+  } catch (_) {}
+
+  const unique = new Map();
+  const maxPages = 80;
+  let unchangedPages = 0;
+  let opened = false;
+  try {
+    for (let page = 0; page < maxPages; page++) {
+      const rows = parseChatRows(await getScreen());
+      let added = 0;
+      for (const row of rows) {
+        const key = row.name.trim() + '\u0000' + row.memberCount.trim();
+        if (!unique.has(key)) { unique.set(key, { ...row, page }); added++; }
+      }
+
+      if (targetIndex !== null && targetIndex >= 0 && targetIndex < unique.size) {
+        const target = [...unique.values()][targetIndex];
+        if (target && target.page === page) {
+          const b = target.bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+          if (!b) throw new Error('選択したグループの位置を読み取れません');
+          const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
+          const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
+          await adb(['shell', 'input', 'tap', String(x), String(y)]);
+          opened = true;
+          await new Promise(resolve => setTimeout(resolve, 1400));
+          return { groups: [...unique.values()], opened: true };
+        }
+      }
+
+      unchangedPages = added === 0 ? unchangedPages + 1 : 0;
+      if (unchangedPages >= 3) break;
+      await adb(['shell', 'input', 'swipe',
+        String(Math.round(width * 0.5)), String(Math.round(height * 0.82)),
+        String(Math.round(width * 0.5)), String(Math.round(height * 0.28)), '450']);
+      await new Promise(resolve => setTimeout(resolve, 450));
+    }
+    if (targetIndex !== null) throw new Error('指定したグループが見つかりません。一覧を再取得してください');
+    return { groups: [...unique.values()], opened };
+  } finally {
+    if (!opened) {
+      // 一覧取得後は先頭へ戻す
+      for (let i = 0; i < maxPages; i++) {
+        await adb(['shell', 'input', 'swipe',
+          String(Math.round(width * 0.5)), String(Math.round(height * 0.25)),
+          String(Math.round(width * 0.5)), String(Math.round(height * 0.82)), '350']).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+    }
   }
-  const xml = await getScreen();
-  return parseChatRows(xml);
+}
+
+async function getGroups() {
+  const result = await scanGroups();
+  return result.groups.map(({ name, memberCount }) => ({ name, memberCount }));
 }
 
 async function status() {
@@ -146,18 +201,11 @@ async function action(name, parameter) {
   }
 
   if (name === 'open-group') {
-    const rows = await getGroups();
     const index = Number(parameter);
-    if (!Number.isInteger(index) || index < 0 || index >= rows.length) {
-      throw new Error('グループ一覧が更新されています。一覧を再取得してください');
-    }
-    const b = rows[index].bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
-    if (!b) throw new Error('選択したグループの位置を読み取れません');
-    const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
-    const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
-    await adb(['shell', 'input', 'tap', String(x), String(y)]);
-    await new Promise(r => setTimeout(r, 1000));
-    return '「' + rows[index].name + '」を開きました';
+    if (!Number.isInteger(index) || index < 0) throw new Error('グループを選択してください');
+    const result = await scanGroups(index);
+    const selected = result.groups[index];
+    return '「' + (selected ? selected.name : '選択したグループ') + '」を開きました';
   }
 
   if (name === 'start') {
@@ -197,23 +245,32 @@ async function action(name, parameter) {
     await adb(['shell', 'input', 'tap', String(x), String(y)]);
     await new Promise(r => setTimeout(r, 700));
 
-    // 通話メニューに「音声通話」が直接表示された場合は選択する
-    const menuXml = await getScreen();
-    const voice = [...menuXml.matchAll(/<node\b[^>]*\/?\s*>/g)]
-      .map(m => attrs(m[0]))
-      .find(a => a.clickable === 'true' &&
-        ((a.text || '').includes('音声通話') || (a['content-desc'] || '').includes('音声通話')));
-
-    if (voice) {
-      const vb = (voice.bounds || '').match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
-      if (!vb) throw new Error('音声通話メニューの位置を読み取れません');
-      const vx = Math.round((Number(vb[1]) + Number(vb[3])) / 2);
-      const vy = Math.round((Number(vb[2]) + Number(vb[4])) / 2);
-      await adb(['shell', 'input', 'tap', String(vx), String(vy)]);
-      return '音声通話を選択しました';
+    // 文字ノード自体がclickable=falseでも、表示位置を直接タップする
+    let voice = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const menuXml = await getScreen();
+      const candidates = [...menuXml.matchAll(/<node\b[^>]*\/?\s*>/g)]
+        .map(m => attrs(m[0]))
+        .filter(a => {
+          const label = (a.text || '') + ' ' + (a['content-desc'] || '');
+          return label.includes('音声通話') && !label.includes('ビデオ');
+        }).filter(a => a.bounds);
+      candidates.sort((a, b) => {
+        const exact = x => ((x.text || '') + (x['content-desc'] || '')).includes('音声通話を開始') ? 0 : 1;
+        return exact(a) - exact(b);
+      });
+      voice = candidates[0] || null;
+      if (voice) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
-
-    return 'グループの通話メニューを開きました。音声通話の選択画面を確認してください';
+    if (!voice) throw new Error('音声通話の開始項目が見つかりません。通話メニューの画面を確認してください');
+    const vb = voice.bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+    if (!vb) throw new Error('音声通話メニューの位置を読み取れません');
+    const vx = Math.round((Number(vb[1]) + Number(vb[3])) / 2);
+    const vy = Math.round((Number(vb[2]) + Number(vb[4])) / 2);
+    await adb(['shell', 'input', 'tap', String(vx), String(vy)]);
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    return '音声通話の開始を選択しました';
   }
 
   throw new Error('未対応の操作です');
@@ -317,7 +374,19 @@ const server = http.createServer(async (req, res) => {
         }
         const data = JSON.parse(body || '{}');
         const message = await action(data.action, data.groupIndex);
-        res.end(JSON.stringify({ ok: true, message }));
+        let chat;
+        if (data.action === 'open-group') {
+          const xml = await getScreen();
+          chat = [];
+          for (const match of xml.matchAll(/<node\b[^>]*\/?\s*>/g)) {
+            const a = attrs(match[0]);
+            const value = (a.text || '').trim();
+            if (!value || /^(送信|戻る|メニュー|通話|ビデオ通話|音声通話|写真|カメラ|検索)$/.test(value)) continue;
+            if (chat[chat.length - 1] !== value) chat.push(value);
+          }
+          chat = chat.slice(-35);
+        }
+        res.end(JSON.stringify({ ok: true, message, ...(chat ? { chat } : {}) }));
         return;
       }
 
