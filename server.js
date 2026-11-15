@@ -242,17 +242,40 @@ async function checkForUpdates() {
 
     console.log('[update] GitHubの更新を取得しました:', remote.slice(0, 7));
     restarting = true;
+    console.log('[update] サーバーを停止して、新しいコードで再起動します');
+
+    // 先に待受を完全に閉じてから子プロセスを起動する。
+    // spawn直後ではなく、子プロセスがlisten成功を通知した時点で親を終了する。
     server.close(() => {
       const child = spawn(process.execPath, [__filename], {
         cwd: __dirname,
-        stdio: 'inherit',
-        env: process.env
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+        env: { ...process.env, LINE_RESTART_HANDSHAKE: '1' }
       });
-      child.once('error', err => {
-        console.error('[update] 再起動に失敗:', err);
+
+      let settled = false;
+      const fail = (message) => {
+        if (settled) return;
+        settled = true;
+        console.error('[update] 新サーバーの起動を確認できません:', message);
         process.exit(1);
+      };
+
+      child.on('message', message => {
+        if (message && message.type === 'listening' && !settled) {
+          settled = true;
+          console.log('[update] 新サーバーの起動を確認しました。旧プロセスを終了します');
+          child.disconnect();
+          process.exit(0);
+        }
+        if (message && message.type === 'startup-error') {
+          fail(message.message || 'listenに失敗しました');
+        }
       });
-      child.once('spawn', () => process.exit(0));
+      child.once('error', err => fail(err.message));
+      child.once('exit', (code, signal) => {
+        if (!settled) fail('子プロセス終了 code=' + code + ' signal=' + signal);
+      });
     });
   } catch (e) {
     console.error('[update] 更新確認/取得に失敗:', e.stderr || e.message);
@@ -326,9 +349,24 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
+server.on('error', err => {
+  console.error('[server] listen/server error:', err);
+  if (process.env.LINE_RESTART_HANDSHAKE === '1' && process.send) {
+    try { process.send({ type: 'startup-error', message: err.message }); } catch (_) {}
+  }
+  if (err.code === 'EADDRINUSE') {
+    console.error('[server] ポート' + PORT + 'は既に使用中です。既存プロセスを確認してください');
+  }
+  process.exitCode = 1;
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`LINE Control Site: http://192.168.1.3:${PORT}`);
   console.log(`GitHub自動更新: ${UPDATE_INTERVAL / 1000}秒ごとに確認 (${REPO_BRANCH})`);
+  if (process.env.LINE_RESTART_HANDSHAKE === '1' && process.send) {
+    process.send({ type: 'listening' });
+    delete process.env.LINE_RESTART_HANDSHAKE;
+  }
   setTimeout(checkForUpdates, 5000);
   setInterval(checkForUpdates, UPDATE_INTERVAL);
 });
