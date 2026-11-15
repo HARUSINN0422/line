@@ -162,31 +162,58 @@ async function action(name, parameter) {
 
   if (name === 'start') {
     const xml = await getScreen();
+    const nodes = [...xml.matchAll(/<node\b[^>]*\/?\s*>/g)].map(m => attrs(m[0]));
 
-    let target = null;
-    for (const m of xml.matchAll(/<node\b[^>]*\/?\s*>/g)) {
-      const a = attrs(m[0]);
-      if (
-        a['resource-id'] ===
-        'jp.naver.line.android:id/chat_ui_group_call_header_starter_voice_button' &&
-        a.clickable === 'true'
-      ) {
-        target = a;
-        break;
-      }
+    // すでにグループ通話が進行中なら、トーク内の「参加」を優先する
+    let target = nodes.find(a =>
+      a['resource-id'] === 'jp.naver.line.android:id/chat_ui_row_groupcall_join_button' &&
+      a.clickable === 'true'
+    );
+
+    if (target) {
+      const b = (target.bounds || '').match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+      if (!b) throw new Error('グループ通話の参加ボタンの位置を読み取れません');
+      const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
+      const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
+      await adb(['shell', 'input', 'tap', String(x), String(y)]);
+      return '進行中のグループ音声通話への参加ボタンを押しました';
     }
 
+    // 通話中でなければ、グループトーク上部の「通話 ボタン」を押す
+    target = nodes.find(a =>
+      a['resource-id'] === 'jp.naver.line.android:id/header_button_layout' &&
+      a['content-desc'] === '通話 ボタン' &&
+      a.clickable === 'true'
+    );
+
     if (!target) {
-      throw new Error('グループの音声通話ボタンが見つかりません。LINEで対象グループのトークを開いてください');
+      throw new Error('グループトーク上部の「通話」ボタンが見つかりません。対象グループのトークを開いてください');
     }
 
     const b = (target.bounds || '').match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
     if (!b) throw new Error('通話ボタンの位置を読み取れません');
-
     const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
     const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
     await adb(['shell', 'input', 'tap', String(x), String(y)]);
-    return 'グループの音声通話ボタンを操作しました';
+    await new Promise(r => setTimeout(r, 700));
+
+    // 通話メニューに「音声通話」が直接表示された場合は選択する
+    const menuXml = await getScreen();
+    const voice = [...menuXml.matchAll(/<node\b[^>]*\/?\s*>/g)]
+      .map(m => attrs(m[0]))
+      .find(a => a.clickable === 'true' &&
+        ((a.text || '').includes('音声通話') || (a['content-desc'] || '').includes('音声通話')));
+
+    if (voice) {
+      const vb = (voice.bounds || '').match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+      if (!vb) throw new Error('音声通話メニューの位置を読み取れません');
+      const vx = Math.round((Number(vb[1]) + Number(vb[3])) / 2);
+      const vy = Math.round((Number(vb[2]) + Number(vb[4])) / 2);
+      await adb(['shell', 'input', 'tap', String(vx), String(vy)]);
+      return '音声通話を選択しました';
+    }
+
+    return 'グループの通話メニューを開きました。音声通話の選択画面を確認してください';
   }
 
   throw new Error('未対応の操作です');
