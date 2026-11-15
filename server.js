@@ -19,10 +19,6 @@ let sessionStartedByServer = false;
 let shuttingDown = false;
 
 function acquireInstanceLock() {
-  const writeLock = () => {
-    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'w' });
-    lockOwned = true;
-  };
   try {
     fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
     lockOwned = true;
@@ -638,7 +634,10 @@ server.on('error', err => {
   if (err.code === 'EADDRINUSE') {
     console.error('[server] ポート' + PORT + 'は既に使用中です。既存プロセスを確認してください');
   }
-  process.exitCode = 1;
+  cleanupManagedResources().finally(() => {
+    releaseInstanceLock();
+    process.exit(1);
+  });
 });
 
 function listenServer() {
@@ -689,4 +688,18 @@ process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(e => {
 process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(e => {
   console.error('[cleanup] 終了処理失敗:', e.message); releaseInstanceLock(); process.exit(1);
 }); });
+process.on('uncaughtException', err => {
+  console.error('[server] uncaughtException:', err);
+  cleanupManagedResources().finally(() => {
+    releaseInstanceLock();
+    process.exit(1);
+  });
+});
+process.on('unhandledRejection', reason => {
+  console.error('[server] unhandledRejection:', reason);
+  cleanupManagedResources().finally(() => {
+    releaseInstanceLock();
+    process.exit(1);
+  });
+});
 process.on('exit', releaseInstanceLock);
