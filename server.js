@@ -349,55 +349,110 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
-// server.js起動時にWaydroidコンテナ・Androidセッション・ADBを順番に起動する
+// server.js起動時にWaydroidコンテナ・Androidセッション・GUI・ADBを順番に起動する
+function waydroidEnvironment() {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || '/run/user/' + uid;
+  return {
+    ...process.env,
+    HOME: process.env.HOME || '/home/harusinn',
+    XDG_RUNTIME_DIR: runtimeDir,
+    DBUS_SESSION_BUS_ADDRESS:
+      process.env.DBUS_SESSION_BUS_ADDRESS || 'unix:path=' + runtimeDir + '/bus',
+    DISPLAY: process.env.DISPLAY || ':0',
+    WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || 'wayland-0'
+  };
+}
+
+function startDetached(command, args, label, env = waydroidEnvironment()) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: __dirname,
+      env,
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.once('spawn', () => {
+      child.unref();
+      console.log('[Waydroid] ' + label + 'を開始しました');
+      resolve();
+    });
+    child.once('error', err => reject(err));
+  });
+}
+
+async function readWaydroidStatus() {
+  const result = await exec('waydroid', ['status'], {
+    timeout: 15000,
+    maxBuffer: 1024 * 1024,
+    env: waydroidEnvironment()
+  });
+  return result.stdout + result.stderr;
+}
+
 async function startWaydroid() {
+  const env = waydroidEnvironment();
   console.log('[Waydroid] 起動を開始します');
 
   // コンテナ起動にはroot権限が必要。sudoersでこのコマンドをNOPASSWD許可しておく。
-  await exec('sudo', ['-n', 'systemctl', 'start', 'waydroid-container'], {
-    timeout: 30000, maxBuffer: 1024 * 1024
+  await exec('sudo', ['-n', '/usr/bin/systemctl', 'start', 'waydroid-container'], {
+    timeout: 30000,
+    maxBuffer: 1024 * 1024,
+    env
   });
 
-  let sessionStatus = '';
+  // session startはAndroidセッションが終了するまで待ち続けるため、バックグラウンド起動する。
+  let statusText = '';
   try {
-    const started = await exec('waydroid', ['session', 'start'], {
-      timeout: 90000, maxBuffer: 1024 * 1024
-    });
-    sessionStatus = started.stdout + started.stderr;
-  } catch (e) {
-    // 既に起動済みの場合はstatusで確認して続行する
-    try {
-      const state = await exec('waydroid', ['status'], { timeout: 15000 });
-      sessionStatus = state.stdout + state.stderr;
-      if (!/Session:\s*RUNNING/i.test(sessionStatus)) throw e;
-    } catch (_) {
-      throw new Error('Waydroidセッションを起動できません: ' + (e.stderr || e.message));
-    }
+    statusText = await readWaydroidStatus();
+  } catch (_) {}
+
+  if (!/Session:\s*RUNNING/i.test(statusText)) {
+    await startDetached('waydroid', ['session', 'start'], 'Androidセッション', env);
+  } else {
+    console.log('[Waydroid] Androidセッションは既に起動しています');
   }
 
-  const deadline = Date.now() + 90000;
+  // Androidが完全に起動し、ADBが応答するまで最大150秒待つ。
+  const deadline = Date.now() + 150000;
   let address = '192.168.240.112';
+  let lastError = '';
+
   while (Date.now() < deadline) {
     try {
-      const state = await exec('waydroid', ['status'], { timeout: 15000 });
-      const output = state.stdout + state.stderr;
-      const match = output.match(/IP(?:\s+address)?:\s*([0-9.]+)/i);
+      statusText = await readWaydroidStatus();
+      const match = statusText.match(/IP(?:\s+address)?:\s*([0-9.]+)/i);
       if (match) address = match[1];
+
       await exec(ADB, ['connect', address + ':5555'], {
-        timeout: 10000, maxBuffer: 1024 * 1024
+        timeout: 10000,
+        maxBuffer: 1024 * 1024,
+        env
       });
       const adbState = await exec(ADB, ['get-state'], {
-        timeout: 10000, maxBuffer: 1024 * 1024
+        timeout: 10000,
+        maxBuffer: 1024 * 1024,
+        env
       });
+
       if (adbState.stdout.trim() === 'device') {
-        console.log('[Waydroid] 起動・ADB接続を確認しました:', address);
-        return;
+        console.log('[Waydroid] Android起動・ADB接続を確認しました:', address);
+        break;
       }
-    } catch (_) {}
+    } catch (e) {
+      lastError = e.stderr || e.message;
+    }
+
     await new Promise(resolve => setTimeout(resolve, 3000));
   }
 
-  throw new Error('Waydroidは起動しましたが、ADB接続を確認できませんでした');
+  if (Date.now() >= deadline) {
+    throw new Error('Android/ADBの起動確認がタイムアウトしました' +
+      (lastError ? ': ' + lastError : ''));
+  }
+
+  // ADB接続確認後にGUIを表示する。Raspberry Pi ConnectのWayland/X11環境を引き継ぐ。
+  await startDetached('waydroid', ['show-full-ui'], 'Android GUI', env);
 }
 
 server.on('error', err => {
