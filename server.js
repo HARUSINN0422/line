@@ -15,6 +15,7 @@ const LOCK_FILE = path.join(__dirname, '.line-server.lock');
 const managedChildren = new Map();
 let lockOwned = false;
 let containerStartedByServer = false;
+let sessionStartedByServer = false;
 let shuttingDown = false;
 
 function acquireInstanceLock() {
@@ -73,13 +74,16 @@ async function cleanupManagedResources() {
   }
   managedChildren.clear();
 
-  // セッション停止はこのserver.jsが開始したAndroidセッションに対して行う
-  try {
-    await exec('waydroid', ['session', 'stop'], {
-      timeout: 25000, maxBuffer: 1024 * 1024, env: waydroidEnvironment()
-    });
-    console.log('[cleanup] Waydroidセッションを停止しました');
-  } catch (_) {}
+  // このserver.jsが開始したセッションだけを停止する
+  if (sessionStartedByServer) {
+    try {
+      await exec('waydroid', ['session', 'stop'], {
+        timeout: 25000, maxBuffer: 1024 * 1024, env: waydroidEnvironment()
+      });
+      console.log('[cleanup] Waydroidセッションを停止しました');
+    } catch (_) {}
+    sessionStartedByServer = false;
+  }
 
   if (containerStartedByServer) {
     try {
@@ -534,6 +538,7 @@ function startDetached(command, args, label, env = waydroidEnvironment()) {
     });
     child.once('spawn', () => {
       managedChildren.set(child.pid, label);
+      if (label === 'Androidセッション') sessionStartedByServer = true;
       child.once('exit', () => managedChildren.delete(child.pid));
       child.unref();
       console.log('[Waydroid] ' + label + 'を開始しました (PID ' + child.pid + ')');
@@ -653,11 +658,17 @@ function listenServer() {
   try {
     acquireInstanceLock();
     console.log('[server] 起動ロックを取得しました (PID ' + process.pid + ')');
+  } catch (e) {
+    console.error('[server] ' + e.message);
+    process.exit(1);
+    return;
+  }
+
+  try {
     await startWaydroid();
   } catch (e) {
-    console.error('[server] 起動準備に失敗しました:', e.message);
-    releaseInstanceLock();
-    process.exit(1);
+    console.error('[Waydroid] 自動起動に失敗しました:', e.message);
+    console.error('[Waydroid] sudoのNOPASSWD設定とWaydroid/ADBの状態を確認してください');
   }
   // Waydroid側に問題があっても管理画面は起動する
   listenServer();
@@ -666,12 +677,7 @@ function listenServer() {
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   console.log('[server] ' + signal + 'を受信。終了処理を開始します');
-  server.close(async () => {
-    await cleanupManagedResources();
-    releaseInstanceLock();
-    process.exit(0);
-  });
-  // listen前や接続残留時でも後始末を開始する
+  server.close();
   await cleanupManagedResources();
   releaseInstanceLock();
   process.exit(0);
