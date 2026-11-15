@@ -11,6 +11,90 @@ const PUBLIC = path.join(__dirname, 'public');
 const UPDATE_INTERVAL = 60 * 1000;
 const REPO_BRANCH = 'main';
 
+const LOCK_FILE = path.join(__dirname, '.line-server.lock');
+const managedChildren = new Map();
+let lockOwned = false;
+let containerStartedByServer = false;
+let shuttingDown = false;
+
+function acquireInstanceLock() {
+  const writeLock = () => {
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'w' });
+    lockOwned = true;
+  };
+  try {
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    lockOwned = true;
+    return;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+  }
+  let oldPid = 0;
+  try { oldPid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim()); } catch (_) {}
+  if (oldPid > 0) {
+    try {
+      process.kill(oldPid, 0);
+      throw new Error('LINEサーバーは既に起動しています (PID ' + oldPid + ')');
+    } catch (e) {
+      if (e.code !== 'ESRCH') throw e;
+    }
+  }
+  try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+  try {
+    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    lockOwned = true;
+  } catch (e) {
+    throw new Error('LINEサーバーの起動ロックを取得できません: ' + e.message);
+  }
+}
+
+function releaseInstanceLock() {
+  if (!lockOwned) return;
+  try {
+    const pid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim());
+    if (pid === process.pid) fs.unlinkSync(LOCK_FILE);
+  } catch (_) {}
+  lockOwned = false;
+}
+
+async function cleanupManagedResources() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('[cleanup] server.jsが起動したプロセスを終了します');
+
+  const groups = [...managedChildren.entries()];
+  for (const [pid, label] of groups) {
+    try {
+      process.kill(-pid, 'SIGTERM');
+      console.log('[cleanup] ' + label + 'を終了しました (PID ' + pid + ')');
+    } catch (e) {
+      if (e.code !== 'ESRCH') console.error('[cleanup] ' + label + '終了失敗:', e.message);
+    }
+  }
+  managedChildren.clear();
+
+  // セッション停止はこのserver.jsが開始したAndroidセッションに対して行う
+  try {
+    await exec('waydroid', ['session', 'stop'], {
+      timeout: 25000, maxBuffer: 1024 * 1024, env: waydroidEnvironment()
+    });
+    console.log('[cleanup] Waydroidセッションを停止しました');
+  } catch (_) {}
+
+  if (containerStartedByServer) {
+    try {
+      await exec('sudo', ['-n', '/usr/bin/systemctl', 'stop', 'waydroid-container'], {
+        timeout: 30000, maxBuffer: 1024 * 1024, env: waydroidEnvironment()
+      });
+      console.log('[cleanup] Waydroidコンテナを停止しました');
+    } catch (e) {
+      console.error('[cleanup] Waydroidコンテナ停止失敗:', e.stderr || e.message);
+    }
+    containerStartedByServer = false;
+  }
+}
+
+
 function allowed(ip) {
   ip = (ip || '').replace('::ffff:', '');
   return ip === '127.0.0.1' || ip === '::1' ||
@@ -305,7 +389,11 @@ async function checkForUpdates() {
 
     // 先に待受を完全に閉じてから子プロセスを起動する。
     // spawn直後ではなく、子プロセスがlisten成功を通知した時点で親を終了する。
-    server.close(() => {
+    server.close(async () => {
+      // GUI/セッション等の旧プロセスを止め、ポートと実行環境を整理してから次を起動
+      await cleanupManagedResources();
+      releaseInstanceLock();
+      shuttingDown = false;
       const child = spawn(process.execPath, [__filename], {
         cwd: __dirname,
         stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
@@ -325,6 +413,7 @@ async function checkForUpdates() {
           settled = true;
           console.log('[update] 新サーバーの起動を確認しました。旧プロセスを終了します');
           child.disconnect();
+          releaseInstanceLock();
           process.exit(0);
         }
         if (message && message.type === 'startup-error') {
@@ -444,8 +533,10 @@ function startDetached(command, args, label, env = waydroidEnvironment()) {
       stdio: 'ignore'
     });
     child.once('spawn', () => {
+      managedChildren.set(child.pid, label);
+      child.once('exit', () => managedChildren.delete(child.pid));
       child.unref();
-      console.log('[Waydroid] ' + label + 'を開始しました');
+      console.log('[Waydroid] ' + label + 'を開始しました (PID ' + child.pid + ')');
       resolve();
     });
     child.once('error', err => reject(err));
@@ -465,12 +556,20 @@ async function startWaydroid() {
   const env = waydroidEnvironment();
   console.log('[Waydroid] 起動を開始します');
 
-  // コンテナ起動にはroot権限が必要。sudoersでこのコマンドをNOPASSWD許可しておく。
-  await exec('sudo', ['-n', '/usr/bin/systemctl', 'start', 'waydroid-container'], {
-    timeout: 30000,
-    maxBuffer: 1024 * 1024,
-    env
-  });
+  // 既に動作中のコンテナは他用途の可能性があるため、停止対象にしない。
+  let containerActive = false;
+  try {
+    const active = await exec('systemctl', ['is-active', 'waydroid-container'], {
+      timeout: 10000, maxBuffer: 1024 * 1024, env
+    });
+    containerActive = active.stdout.trim() === 'active';
+  } catch (_) {}
+  if (!containerActive) {
+    await exec('sudo', ['-n', '/usr/bin/systemctl', 'start', 'waydroid-container'], {
+      timeout: 30000, maxBuffer: 1024 * 1024, env
+    });
+    containerStartedByServer = true;
+  }
 
   // session startはAndroidセッションが終了するまで待ち続けるため、バックグラウンド起動する。
   let statusText = '';
@@ -552,14 +651,36 @@ function listenServer() {
 
 (async () => {
   try {
+    acquireInstanceLock();
+    console.log('[server] 起動ロックを取得しました (PID ' + process.pid + ')');
     await startWaydroid();
   } catch (e) {
-    console.error('[Waydroid] 自動起動に失敗しました:', e.message);
-    console.error('[Waydroid] sudoのNOPASSWD設定とWaydroid/ADBの状態を確認してください');
+    console.error('[server] 起動準備に失敗しました:', e.message);
+    releaseInstanceLock();
+    process.exit(1);
   }
   // Waydroid側に問題があっても管理画面は起動する
   listenServer();
 })();
 
-process.on('SIGTERM', () => server.close(() => process.exit(0)));
-process.on('SIGINT', () => server.close(() => process.exit(0)));
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  console.log('[server] ' + signal + 'を受信。終了処理を開始します');
+  server.close(async () => {
+    await cleanupManagedResources();
+    releaseInstanceLock();
+    process.exit(0);
+  });
+  // listen前や接続残留時でも後始末を開始する
+  await cleanupManagedResources();
+  releaseInstanceLock();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(e => {
+  console.error('[cleanup] 終了処理失敗:', e.message); releaseInstanceLock(); process.exit(1);
+}); });
+process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(e => {
+  console.error('[cleanup] 終了処理失敗:', e.message); releaseInstanceLock(); process.exit(1);
+}); });
+process.on('exit', releaseInstanceLock);
