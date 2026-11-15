@@ -349,6 +349,57 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
+// server.js起動時にWaydroidコンテナ・Androidセッション・ADBを順番に起動する
+async function startWaydroid() {
+  console.log('[Waydroid] 起動を開始します');
+
+  // コンテナ起動にはroot権限が必要。sudoersでこのコマンドをNOPASSWD許可しておく。
+  await exec('sudo', ['-n', 'systemctl', 'start', 'waydroid-container'], {
+    timeout: 30000, maxBuffer: 1024 * 1024
+  });
+
+  let sessionStatus = '';
+  try {
+    const started = await exec('waydroid', ['session', 'start'], {
+      timeout: 90000, maxBuffer: 1024 * 1024
+    });
+    sessionStatus = started.stdout + started.stderr;
+  } catch (e) {
+    // 既に起動済みの場合はstatusで確認して続行する
+    try {
+      const state = await exec('waydroid', ['status'], { timeout: 15000 });
+      sessionStatus = state.stdout + state.stderr;
+      if (!/Session:\s*RUNNING/i.test(sessionStatus)) throw e;
+    } catch (_) {
+      throw new Error('Waydroidセッションを起動できません: ' + (e.stderr || e.message));
+    }
+  }
+
+  const deadline = Date.now() + 90000;
+  let address = '192.168.240.112';
+  while (Date.now() < deadline) {
+    try {
+      const state = await exec('waydroid', ['status'], { timeout: 15000 });
+      const output = state.stdout + state.stderr;
+      const match = output.match(/IP(?:\s+address)?:\s*([0-9.]+)/i);
+      if (match) address = match[1];
+      await exec(ADB, ['connect', address + ':5555'], {
+        timeout: 10000, maxBuffer: 1024 * 1024
+      });
+      const adbState = await exec(ADB, ['get-state'], {
+        timeout: 10000, maxBuffer: 1024 * 1024
+      });
+      if (adbState.stdout.trim() === 'device') {
+        console.log('[Waydroid] 起動・ADB接続を確認しました:', address);
+        return;
+      }
+    } catch (_) {}
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+
+  throw new Error('Waydroidは起動しましたが、ADB接続を確認できませんでした');
+}
+
 server.on('error', err => {
   console.error('[server] listen/server error:', err);
   if (process.env.LINE_RESTART_HANDSHAKE === '1' && process.send) {
@@ -360,16 +411,29 @@ server.on('error', err => {
   process.exitCode = 1;
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`LINE Control Site: http://192.168.1.3:${PORT}`);
-  console.log(`GitHub自動更新: ${UPDATE_INTERVAL / 1000}秒ごとに確認 (${REPO_BRANCH})`);
-  if (process.env.LINE_RESTART_HANDSHAKE === '1' && process.send) {
-    process.send({ type: 'listening' });
-    delete process.env.LINE_RESTART_HANDSHAKE;
+function listenServer() {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`LINE Control Site: http://192.168.1.3:${PORT}`);
+    console.log(`GitHub自動更新: ${UPDATE_INTERVAL / 1000}秒ごとに確認 (${REPO_BRANCH})`);
+    if (process.env.LINE_RESTART_HANDSHAKE === '1' && process.send) {
+      process.send({ type: 'listening' });
+      delete process.env.LINE_RESTART_HANDSHAKE;
+    }
+    setTimeout(checkForUpdates, 5000);
+    setInterval(checkForUpdates, UPDATE_INTERVAL);
+  });
+}
+
+(async () => {
+  try {
+    await startWaydroid();
+  } catch (e) {
+    console.error('[Waydroid] 自動起動に失敗しました:', e.message);
+    console.error('[Waydroid] sudoのNOPASSWD設定とWaydroid/ADBの状態を確認してください');
   }
-  setTimeout(checkForUpdates, 5000);
-  setInterval(checkForUpdates, UPDATE_INTERVAL);
-});
+  // Waydroid側に問題があっても管理画面は起動する
+  listenServer();
+})();
 
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 process.on('SIGINT', () => server.close(() => process.exit(0)));
