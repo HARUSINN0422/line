@@ -45,8 +45,72 @@ function attrs(xml) {
 }
 
 async function getScreen() {
-  await adb(['shell', 'uiautomator', 'dump', '/sdcard/line-control.xml'], 20000);
-  return adb(['exec-out', 'cat', '/sdcard/line-control.xml'], 10000);
+  // 古いXMLを使い回さない。UIAutomatorが一時的にnullを返す場合は再試行する
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await adb(['shell', 'rm', '-f', '/sdcard/line-control.xml']);
+      await new Promise(r => setTimeout(r, 350));
+      const output = await adb(['shell', 'uiautomator', 'dump', '/sdcard/line-control.xml'], 25000);
+      if (!output.includes('UI hierchary dumped')) throw new Error(output || '画面XMLを取得できません');
+      const xml = await adb(['exec-out', 'cat', '/sdcard/line-control.xml'], 10000);
+      if (xml.includes('<hierarchy') && xml.includes('</hierarchy>')) return xml;
+    } catch (e) {
+      if (attempt === 2) throw new Error('LINE画面の取得に失敗しました: ' + e.message);
+    }
+    await new Promise(r => setTimeout(r, 900));
+  }
+  throw new Error('LINE画面のXMLが空です');
+}
+
+function parseChatRows(xml) {
+  const root = { children: [] };
+  const stack = [root];
+  const tokens = xml.match(/<node\\b[^>]*\\/>|<node\\b[^>]*>|<\\/node>/g) || [];
+  for (const token of tokens) {
+    if (token.startsWith('</node')) {
+      if (stack.length > 1) stack.pop();
+      continue;
+    }
+    const node = { attrs: attrs(token), children: [] };
+    stack[stack.length - 1].children.push(node);
+    if (!token.endsWith('/>')) stack.push(node);
+  }
+
+  const find = (node, id) => {
+    if (node.attrs && node.attrs['resource-id'] === id) return node;
+    for (const child of node.children || []) {
+      const found = find(child, id);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const rows = [];
+  const walk = node => {
+    if (node.attrs && node.attrs['resource-id'] === 'jp.naver.line.android:id/root' &&
+        node.attrs.clickable === 'true') {
+      const name = find(node, 'jp.naver.line.android:id/name');
+      const members = find(node, 'jp.naver.line.android:id/member_count');
+      if (name && name.attrs.text && members) {
+        rows.push({
+          name: name.attrs.text,
+          memberCount: members.attrs.text || '',
+          bounds: node.attrs.bounds || ''
+        });
+      }
+    }
+    for (const child of node.children || []) walk(child);
+  };
+  walk(root);
+  return rows;
+}
+
+async function getGroups() {
+  if ((await adb(['get-state'])) !== 'device') {
+    throw new Error('ADBがAndroidに接続されていません');
+  }
+  const xml = await getScreen();
+  return parseChatRows(xml);
 }
 
 async function status() {
@@ -71,7 +135,7 @@ async function status() {
   return { connected, running, title };
 }
 
-async function action(name) {
+async function action(name, parameter) {
   if ((await adb(['get-state'])) !== 'device') {
     throw new Error('ADBがAndroidに接続されていません');
   }
@@ -81,9 +145,22 @@ async function action(name) {
     return 'LINEを起動しました';
   }
 
+  if (name === 'open-group') {
+    const rows = await getGroups();
+    const index = Number(parameter);
+    if (!Number.isInteger(index) || index < 0 || index >= rows.length) {
+      throw new Error('グループ一覧が更新されています。一覧を再取得してください');
+    }
+    const b = rows[index].bounds.match(/\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]/);
+    if (!b) throw new Error('選択したグループの位置を読み取れません');
+    const x = Math.round((Number(b[1]) + Number(b[3])) / 2);
+    const y = Math.round((Number(b[2]) + Number(b[4])) / 2);
+    await adb(['shell', 'input', 'tap', String(x), String(y)]);
+    await new Promise(r => setTimeout(r, 1000));
+    return '「' + rows[index].name + '」を開きました';
+  }
+
   if (name === 'start') {
-    await adb(['shell', 'am', 'start', '-n', 'jp.naver.line.android/.activity.SplashActivity']);
-    await new Promise(r => setTimeout(r, 1500));
     const xml = await getScreen();
 
     let target = null;
@@ -176,6 +253,12 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/groups') {
+        const groups = await getGroups();
+        res.end(JSON.stringify({ groups }));
+        return;
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/action') {
         let body = '';
         for await (const chunk of req) {
@@ -183,7 +266,7 @@ const server = http.createServer(async (req, res) => {
           if (body.length > 10000) throw new Error('リクエストが大きすぎます');
         }
         const data = JSON.parse(body || '{}');
-        const message = await action(data.action);
+        const message = await action(data.action, data.groupIndex);
         res.end(JSON.stringify({ ok: true, message }));
         return;
       }
