@@ -18,6 +18,8 @@ button{width:100%;padding:15px;margin:7px 0;border:0;border-radius:9px;font-size
 button:disabled,select:disabled{opacity:.4;cursor:not-allowed}
 select{width:100%;padding:14px;margin:7px 0;background:#101820;color:#edf3f7;border:1px solid #506575;border-radius:9px;font-size:16px}
 #message{min-height:48px;white-space:pre-wrap;color:#c8d5df}
+#chat{max-height:420px;overflow:auto;background:#101820;border:1px solid #344653;border-radius:9px;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}
+.chat-line{padding:7px 0;border-bottom:1px solid #293945}
 small{color:#aab9c5;line-height:1.7}
 </style>
 </head>
@@ -40,6 +42,8 @@ small{color:#aab9c5;line-height:1.7}
   <button class="primary" onclick="send('start')">選択したグループで音声通話を開始</button>
   <button class="secondary" disabled>通話に参加（準備中）</button>
   <button class="secondary" disabled>通話から退出（準備中）</button>
+  <h3>選択したグループのチャット</h3>
+  <div id="chat">グループを開くと、画面に表示されているチャット内容をここに表示します。</div>
   <p id="message">状態を確認しています。</p>
 </div>
 <small>
@@ -103,6 +107,20 @@ async function send(action,groupIndex){
     });
     const d=await r.json();
     m.textContent=d.message||d.error||'完了';
+    if(action==='open-group' && r.ok){
+      const chat=document.getElementById('chat');
+      chat.textContent='';
+      if(d.chat && d.chat.length){
+        d.chat.forEach(line=>{
+          const item=document.createElement('div');
+          item.className='chat-line';
+          item.textContent=line;
+          chat.appendChild(item);
+        });
+      }else{
+        chat.textContent='表示できるチャット内容が見つかりませんでした。';
+      }
+    }
   }catch(e){m.textContent='通信エラー: '+e.message}
   setTimeout(refresh,1000);
 }
