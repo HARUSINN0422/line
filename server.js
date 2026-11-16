@@ -11,6 +11,25 @@ const PUBLIC = path.join(__dirname, 'public');
 const UPDATE_INTERVAL = 60 * 1000;
 const REPO_BRANCH = 'main';
 
+// screen外から直接起動された場合も、必ず screen セッション「line」の中で動かす。
+// 自動更新時の子プロセスは stdio: inherit で起動するため、同じ screen セッションを引き継ぐ。
+if (!process.env.STY && process.env.LINE_SCREEN_CHILD !== '1') {
+  const screen = spawn('screen', ['-DmS', 'line', process.execPath, __filename], {
+    cwd: __dirname,
+    env: { ...process.env, LINE_SCREEN_CHILD: '1' },
+    stdio: 'ignore'
+  });
+  screen.once('error', err => {
+    console.error('[server] screenで起動できません:', err.message);
+    process.exit(1);
+  });
+  screen.once('spawn', () => {
+    console.log('[server] screenセッション「line」で起動しました。screen -r line で確認できます');
+    process.exit(0);
+  });
+  return;
+}
+
 const LOCK_FILE = path.join(__dirname, '.line-server.lock');
 const managedChildren = new Map();
 let lockOwned = false;
