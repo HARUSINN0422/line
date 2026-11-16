@@ -441,7 +441,15 @@ async function checkForUpdates() {
       });
       child.once('error', err => fail(err.message));
       child.once('exit', (code, signal) => {
-        if (!settled) fail('子プロセス終了 code=' + code + ' signal=' + signal);
+        if (settled) return;
+        // 旧サーバーがscreen外で動いていた場合、新サーバー側の起動処理が
+        // screen「line」を作成して親プロセスは正常終了する。
+        if (!process.env.STY && code === 0) {
+          settled = true;
+          console.log('[update] 新サーバーをscreen「line」で起動しました');
+          process.exit(0);
+        }
+        fail('子プロセス終了 code=' + code + ' signal=' + signal);
       });
     });
   } catch (e) {
