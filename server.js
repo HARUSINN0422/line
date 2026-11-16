@@ -122,6 +122,9 @@ function allowed(ip) {
 
 // ADB操作を直列化し、uiautomator dumpの同時実行を防ぐ
 let adbQueue = Promise.resolve();
+// UIAutomatorのdump・XML読み込みは同じファイルを使うため、処理全体を直列化する。
+// adbコマンド単体の直列化だけでは、複数のgetScreen()同士の競合を防げない。
+let screenQueue = Promise.resolve();
 function adb(args, timeout = 15000) {
   const task = adbQueue.then(async () => {
     const result = await exec(ADB, args, {
@@ -147,22 +150,41 @@ function attrs(xml) {
   return result;
 }
 
-async function getScreen() {
+async function getScreenUnlocked() {
   // 古いXMLを使い回さない。UIAutomatorが一時的にnullを返す場合は再試行する
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let lastError = '';
+  for (let attempt = 0; attempt < 4; attempt++) {
     try {
       await adb(['shell', 'rm', '-f', '/sdcard/line-control.xml']);
-      await new Promise(r => setTimeout(r, 350));
-      const output = await adb(['shell', 'uiautomator', 'dump', '/sdcard/line-control.xml'], 25000);
-      if (!output.includes('UI hierchary dumped')) throw new Error(output || '画面XMLを取得できません');
-      const xml = await adb(['exec-out', 'cat', '/sdcard/line-control.xml'], 10000);
-      if (xml.includes('<hierarchy') && xml.includes('</hierarchy>')) return xml;
+      await new Promise(r => setTimeout(r, 500));
+      const output = await adb(['shell', 'uiautomator', 'dump', '/sdcard/line-control.xml'], 30000);
+      if (!output.includes('UI hierchary dumped')) {
+        throw new Error(output || 'UIAutomatorのdumpが成功しませんでした');
+      }
+
+      // exec-outが空を返す環境向けに、通常のshell catでも読み直す
+      let xml = await adb(['exec-out', 'cat', '/sdcard/line-control.xml'], 15000).catch(() => '');
+      if (!xml.includes('<hierarchy') || !xml.includes('</hierarchy>')) {
+        xml = await adb(['shell', 'cat', '/sdcard/line-control.xml'], 15000).catch(() => '');
+      }
+      if (xml.includes('<hierarchy') && xml.includes('</hierarchy>') && xml.includes('<node')) {
+        return xml;
+      }
+      lastError = 'UIAutomatorはdump成功を返しましたが、有効なnodeを含むXMLを読み取れませんでした';
     } catch (e) {
-      if (attempt === 2) throw new Error('LINE画面の取得に失敗しました: ' + e.message);
+      lastError = e.message;
     }
-    await new Promise(r => setTimeout(r, 900));
+    if (attempt < 3) await new Promise(r => setTimeout(r, 1000 + attempt * 500));
   }
-  throw new Error('LINE画面のXMLが空です');
+  throw new Error('LINE画面のXMLを取得できません: ' + (lastError || 'XMLが空です'));
+}
+
+// XMLファイルの削除・dump・読み込みを一つの処理として排他制御する。
+// ステータス確認とグループ一覧取得が同時に呼ばれても、同じXMLを奪い合わない。
+function getScreen() {
+  const task = screenQueue.then(() => getScreenUnlocked());
+  screenQueue = task.catch(() => {});
+  return task;
 }
 
 function parseChatRows(xml) {
